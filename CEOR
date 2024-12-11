@@ -1,0 +1,939 @@
+"""
+ Future用确定性的gurobi求解的数据库
+"""
+# 导入库
+import time
+# import tsfel
+import pandas as pd
+import numpy as np
+import os
+from OD_read_Data_saperate import readODData
+from ijlink_provider import link_proveider
+from compareQoS import compare_qos
+from sort_data import sortData
+
+from itertools import combinations
+from scipy.special import comb
+import time
+# from get_db_features_py import get_db_features_version1
+from get_db_traffic import get_db_traffic
+from predicted_traffic import get_predicted_traffic   # T2时段，即就是决策时隙t读入流量的函数（如果修改流量数据输入，修改这里）
+from get_db_time0_policy_final import get_db_time0_policy
+
+
+
+# 参数修改
+sampleTime = 8640  # 一个月的采样时段数
+
+appKinds = 3  # 应用数
+M = 10 ** 12  # 极大数
+p95 = int(sampleTime * 0.05)  # 免费时段数
+
+
+
+# 文件存储路径
+groundNode = 10  # 站点数
+predicted_traffic_path = "../Test/10site/flowData"
+dataResultPath = "../Test/10site/d_CEOR/1.05d_gap36.22%"    # 测试修改
+data_path = "../Test/10site/3-23Gurobi_PIR/one_month/3-23Gurobi_PIR_1.05d(one_month)"    # Future样本轨道路径  测试修改
+# data_path = "../../../【主动型自适应网络优化控制】/7.数据/第7阶段/Test/10site/1-04离线动态gurobi"    # Future样本轨道路径
+
+topoPath = "../Test/10site/network"
+rawTopoFileName = "network-3-23.csv"
+topoFileName = rawTopoFileName.split(".")[0] + "_SHOW.csv"  # 存储各链路成本与SLA信息的文件
+topoFileName1 = rawTopoFileName.split(".")[0] + "_ij.csv"
+
+if not os.path.isdir(dataResultPath):
+    os.mkdir(dataResultPath)
+
+# 读取网络文件
+network = pd.read_csv(os.path.join(topoPath, topoFileName))  # 例如："network-3-23_SHOW.csv"
+networkColumns = list(network.columns)
+networkAttr = network[networkColumns]
+networkAttr = np.array(networkAttr)
+
+# 读取链路的相关信息
+capacity = list(network["capacity"])
+baseCap = list(network["base_capacity"])
+fixedCost = list(network["fixed_cost"])
+extraCost = list(network["variable_cost"])
+linkID = list(network["LinkID"])
+totalFixedCost = sum(fixedCost)
+
+linkNum = len(capacity)  # 链路总数
+linkNum_ri = 4  # ri链路数
+linkNum_ij = linkNum - linkNum_ri
+print("linkNum", linkNum)
+
+predicted_data_array = get_predicted_traffic(predicted_traffic_path, sampleTime, groundNode)
+traffic0 = np.zeros((sampleTime, linkNum))
+traffic1 = np.zeros((sampleTime, linkNum))
+
+# provider = {"cloud", linkID} link_groundNode = {"site", linkID} ij_ri = {"linkID", 2(MPLS_2)} ij_node ={“linkID”, site}
+provider, link_groundNode, ij_ri, ij_node = link_proveider(topoPath, groundNode,
+                                                    topoFileName)  # topoPath = "../Data_mid/100site" groundNode = 100 topoFileName = "network100_1_SHOW.csv"
+# link_groundNode_app = {app{site: linkID}}
+link_groundNode_app = compare_qos(topoPath, groundNode, topoFileName1)  # topoFileName1 = "network100_1_ij.csv"
+print("link_groundNode_app", link_groundNode_app)
+
+nodeBase = np.zeros([groundNode])
+nodeBasecost = np.zeros([groundNode])
+nodeExtra = np.zeros([groundNode])
+for i in range(groundNode):
+    for j in range(len(link_groundNode[str(i)])):
+        nodeBase[i] += baseCap[link_groundNode[str(i)][j] + 4]
+        nodeBasecost += fixedCost[link_groundNode[str(i)][j] + 4]
+        nodeExtra[i] += extraCost[link_groundNode[str(i)][j] + 4]
+
+
+# 站点分类的OD流量排序
+demand = readODData(groundNode, predicted_traffic_path, sampleTime)  # [sampleTime, 2, groundNode, 3]
+
+data_bw = []
+
+y_policy = []
+y_policy_name = []
+traffic_name = []
+
+
+# 节点类
+class NodeAttr:
+    def __init__(self, node_id, appKinds, links, num_link, node_demand):
+        self.node_id = node_id  # 节点ID
+        self.appKinds = appKinds  # 应用数
+        self.links = links  # {site：linkID} 节点连接的链路
+        self.num_link = num_link  # 节点连接的链路数量
+        self.node_demand = node_demand  # 节点i在每一历史采样时刻的每一类型业务的上下行流量需求, [sample_time, p, k]
+        self.y_SLA = np.zeros([self.appKinds, self.num_link])  # 满足所有业务的SLA的链路 size(业务数，链路数量) 0-1变量
+        self.ylist = np.zeros([self.appKinds, self.num_link])  # 当前三种业务分配方案选择的链路 size(业务数，链路数量)
+        self.y_min = np.zeros([self.appKinds, self.num_link])  # size(业务数，链路数量)
+        self.num_solution = np.zeros([self.appKinds])  # 业务k的可选解决方案数目
+        self.factor = np.zeros([self.appKinds, self.num_link])  # size(业务数，链路数量)
+        self.max_ri_frac = 0  # 与站点相连的ri链路中计费带宽与基线带宽之比的最大值
+
+
+nodeSet = []  # 节点集合
+for i in range(groundNode):
+    node = NodeAttr(i, 3, link_groundNode[str(i)], len(link_groundNode[str(i)]), demand[:, :, i, :])
+    nodeSet.append(node)
+
+
+# 链路类
+class LinkAttr:
+    def __init__(self, id, baseCap, capacity, fixedCost, extraCost, latency, jitter, loss):
+        self.id = id  # 链路ID
+        self.baseCap = baseCap  # 基线带宽
+        self.capacity = capacity  # 最大带宽
+        self.fixedCost = fixedCost  # 固定成本
+        self.extraCost = extraCost  # 弹性成本
+        self.latency = latency  # 延迟(ms)
+        self.jitter = jitter  # 抖动(ms)
+        self.loss = loss  # 丢包率(%)
+        self.traffic0 = np.zeros(sampleTime)  #
+        self.traffic1 = np.zeros(sampleTime)  #
+        self.frac = 0  # 计费带宽/基线带宽之比
+        self.billBandwidth = 0  # p95计费带宽(取上下行流量最大值)
+        self.price = 0  #
+        self.factor = np.zeros(3)  #
+        self.isCap = 0  #
+        self.temp_billing_bd = np.zeros(2)  # 该链路的临时带宽 （432）
+        self.temp_billing_bd_next = np.zeros(2)  # 该链路的临时带宽的上一位 （431）
+
+
+rilinkSet = []  # ri链路集合
+for i in range(linkNum_ri):
+    link = LinkAttr(linkID[i], baseCap[i], capacity[i], fixedCost[i], extraCost[i], list(network["latency(ms)"])[i]
+                    , list(network["jitter(ms)"])[i], list(network["lost(%)"])[i])
+    rilinkSet.append(link)
+
+ijlinkSet = []  # ij链路集合
+for j in range(linkNum_ij):
+    i = j + 4
+    link = LinkAttr(linkID[i], baseCap[i], capacity[i], fixedCost[i], extraCost[i], list(network["latency(ms)"])[i]
+                    , list(network["jitter(ms)"])[i], list(network["lost(%)"])[i])
+    ijlinkSet.append(link)
+
+
+class PredictRouteOptimez:
+    def __init__(self, Nodes, ijLinks, ri_links, steps):
+        self.nodeSet = Nodes
+        self.ijlinkSet = ijLinks
+        self.rilinkSet = ri_links
+        # self.baseAllocate = baseAllocate
+        self.steps = steps
+        self.temp_ricost = np.zeros([linkNum_ri])
+
+        self.sat_sols()
+
+    def frac_p95(self, node):
+        """
+         fucntion:
+                 计算与输入node站点相连的ij链路相关的上层ri链路中P95计费带宽与基线带宽之比的最大值
+         Input: nodeID
+         Output: maxFrac
+        """
+        maxFrac = 0
+        frac_ri = np.zeros([self.nodeSet[node].num_link])
+        for i in range(self.nodeSet[node].num_link):
+            ij_index = self.nodeSet[node].links[i]
+            ri_index = ij_ri[str(ij_index)]
+            frac_ri[i] = self.rilinkSet[ri_index].billBandwidth / self.rilinkSet[ri_index].baseCap  # 计费带宽/基线带宽
+            self.rilinkSet[ri_index].frac = frac_ri[i]
+            if maxFrac < frac_ri[i]:
+                maxFrac = frac_ri[i]
+        self.nodeSet[node].max_ri_frac = maxFrac
+        return maxFrac
+
+    def cal_ij_cost(self, ij_index):
+        """
+        计算指定ij链路的费用
+        """
+        bill0 = self.ijlinkSet[ij_index].traffic0.tolist()
+        bill0.sort()
+        bill0.reverse()
+
+        bill1 = self.ijlinkSet[ij_index].traffic1.tolist()
+        bill1.sort()
+        bill1.reverse()
+
+        self.ijlinkSet[ij_index].billBandwidth = max(bill0[p95], bill1[p95])
+
+        if self.ijlinkSet[ij_index].billBandwidth > self.ijlinkSet[ij_index].capacity:
+            self.ijlinkSet[ij_index].price = M * M
+        else:
+            if self.ijlinkSet[ij_index].billBandwidth > self.ijlinkSet[ij_index].baseCap:
+                self.ijlinkSet[ij_index].price = (self.ijlinkSet[ij_index].billBandwidth - self.ijlinkSet[
+                    ij_index].baseCap) * self.ijlinkSet[ij_index].extraCost + self.ijlinkSet[ij_index].fixedCost
+            else:
+                self.ijlinkSet[ij_index].price = self.ijlinkSet[ij_index].fixedCost
+
+    def ri_cal_cost(self, ri_index):
+
+        bill0 = self.rilinkSet[ri_index].traffic0.tolist()
+        bill0.sort()
+        bill0.reverse()
+
+        bill1 = self.rilinkSet[ri_index].traffic1.tolist()
+        bill1.sort()
+        bill1.reverse()
+
+        self.rilinkSet[ri_index].billBandwidth = max(bill0[p95], bill1[p95])
+
+        if self.rilinkSet[ri_index].billBandwidth > self.rilinkSet[ri_index].capacity:
+            self.rilinkSet[ri_index].price = M * M
+        else:
+            if self.rilinkSet[ri_index].billBandwidth > self.rilinkSet[ri_index].baseCap:
+                self.rilinkSet[ri_index].price = (self.rilinkSet[ri_index].billBandwidth - self.rilinkSet[
+                    ri_index].baseCap) * self.rilinkSet[ri_index].extraCost + self.rilinkSet[ri_index].fixedCost
+            else:
+                self.rilinkSet[ri_index].price = self.rilinkSet[ri_index].fixedCost
+
+    def ri_cost_base_bb(self, ri_index):
+        """test:判断方案时分配
+           input: ri_index: 0: Internet 1: MPLS_0 2: MPLS_1 3: MPLS_2
+             """
+        if self.rilinkSet[ri_index].billBandwidth > self.rilinkSet[ri_index].capacity:  # 计费带宽超过最大弹性带宽->不可行
+            self.rilinkSet[ri_index].price = M * M
+        else:  # 计算ri链路的费用
+            if self.rilinkSet[ri_index].billBandwidth > self.rilinkSet[ri_index].baseCap:
+                self.rilinkSet[ri_index].price = (self.rilinkSet[ri_index].billBandwidth - self.rilinkSet[
+                    ri_index].baseCap) * self.rilinkSet[ri_index].extraCost + self.rilinkSet[ri_index].fixedCost
+            else:
+                self.rilinkSet[ri_index].price = self.rilinkSet[ri_index].fixedCost
+
+    def ij_cost_base_bb(self, ij_index):
+        """test:判断方案时分配
+           input: ri_index: 0: Internet 1: MPLS_0 2: MPLS_1 3: MPLS_2
+             """
+        if self.ijlinkSet[ij_index].billBandwidth > self.ijlinkSet[ij_index].capacity:
+            self.ijlinkSet[ij_index].price = M * M
+        else:
+            if self.ijlinkSet[ij_index].billBandwidth > self.ijlinkSet[ij_index].baseCap:
+                self.ijlinkSet[ij_index].price = (self.ijlinkSet[ij_index].billBandwidth - self.ijlinkSet[
+                    ij_index].baseCap) * self.ijlinkSet[ij_index].extraCost + self.ijlinkSet[ij_index].fixedCost
+            else:
+                self.ijlinkSet[ij_index].price = self.ijlinkSet[ij_index].fixedCost
+
+    def Y_start(self, node, link_groundNode_app):
+        """
+        function:
+                在各业务可有链路中筛选满足所有业务SLA的链路
+            input:
+                node:siteID
+                link_groundNode_app: set of available linkID of sites
+            output:
+                满足所有业务SLA的链路 size:[appKinds, node.num_link]
+        """
+        y = np.zeros([appKinds, self.nodeSet[node].num_link])
+        for i in range(self.nodeSet[node].num_link):
+            for k in range(appKinds):
+                y[k][i] = link_groundNode_app[str(2)][str(node)][i]
+        for i in range(self.nodeSet[node].num_link):
+            for k in range(appKinds):
+                for j in range(len(link_groundNode_app[str(k)][str(node)])):
+                    if y[k][i] == link_groundNode_app[str(k)][str(node)][j]:
+                        y[k][i] = 10000
+        for i in range(self.nodeSet[node].num_link):
+            for k in range(3):
+                if y[k][i] == 10000:
+                    y[k][i] = 1
+                else:
+                    y[k][i] = 0
+        return y
+
+    def modify_Yk(self, node, k):
+        """
+        function：
+            针对业务k列出所有可能的y方案
+        Input:
+            node:站点ID
+            k: 业务类型
+        Output：
+            y_select： 表示全部可选方案 type：np.array([length0, num_link])
+            length0： 表示可选方案的数量
+        """
+        y0 = {}
+        sel_list = []
+        length0 = 0
+        y_start = self.nodeSet[node].y_SLA[k]
+        sumsol = int(sum(y_start[i] for i in range(self.nodeSet[node].num_link)))  # 此类业务在该站点总共可用链路
+        # 计算业务k在站点node的可选链路的排列组合
+        for i in range(self.nodeSet[node].num_link):  # site连接链路数
+            if y_start[i] == 1:
+                sel_list.append(i)  # 此类业务在该站点可用链路的集合
+        for m in range(len(sel_list)):
+            temp = list(combinations(sel_list, (m + 1)))  # 可选链路集合中选择m+1条链路的组合集合
+            length = int(comb(sumsol, m + 1))  # 可选链路集合中选择m+1条链路的组合的数目
+            for n in range(length):
+                y0[str(n + length0)] = temp[n]
+            length0 += length
+
+        y_select = np.zeros([length0, self.nodeSet[node].num_link])  # [总的排列组合数， 总链路数]
+        self.nodeSet[node].num_solution[k] = length0
+        for sol in range(length0):
+            temp = np.zeros(self.nodeSet[node].num_link)
+            for m in range(len(y0[str(sol)])):
+                index = y0[str(sol)][m]
+                temp[index] = 1
+            y_start = temp.copy()
+            y_select[sol] = y_start.copy()
+        return y_select, length0
+
+    def Y_feasible(self, y_sol, len_sol):
+        """
+        function: 判断可行方案，如果一个方案中，站点的n条链路中的第i条链路没有被任一业务流量使用，则剔除该方案
+        Input: y_old: 分配方案 size：[length, appKinds, num_link]
+            length:初始分配方案个数
+            node: 站点ID
+        """
+        num_sol = 0
+        total_sol = []
+        for a in y_sol[str(0)]:
+            for b in y_sol[str(1)]:
+                for c in y_sol[str(2)]:
+                    sol = np.array([a, b, c])
+                    if 0 not in sol.sum(axis=0):
+                        total_sol.append(sol)
+                        num_sol += 1
+        return total_sol, num_sol
+
+    def cal_factor(self, y, k, i, node):
+        """
+        function：计算在站点Node中业务k在链路i的UCMP分流比
+        Input: y: self.nodeSet[node].ylist
+            k：业务k
+            i：站点连接链路编号
+            node: Node类
+        Output:
+            在站点Node中业务k在链路i的UCMP分流比
+        已修改成不考虑u的形式
+        i表示该站点的链路排序,y[k][i]
+        选路变量y可直接使用，但参数（容量，基线带宽）需要重新对应
+        针对一个业务k计算每个链路的分流比
+        """
+        sum = 0
+        # 如果该应用只有一条链路承载，则分流比为0
+
+        for j in range(self.nodeSet[node].num_link):
+            index = self.nodeSet[node].links[j]
+            sum += y[k][j] * self.ijlinkSet[index].baseCap
+        index_ij = self.nodeSet[node].links[i]
+        if sum > 0:
+            factor = self.ijlinkSet[index_ij].baseCap * y[k][i] / sum
+        else:
+            factor = 0
+        return factor
+
+
+    def static_allocate(self, node, ts, decide_sort=False):
+        # 计算分流比
+        for k in range(3):
+            # 如果只有一条路可以选
+            if sum(self.nodeSet[node].ylist[k, i] for i in range(self.nodeSet[node].num_link)) <= 1:
+                self.nodeSet[node].factor[k, :] = self.nodeSet[node].ylist[k, :]
+                continue
+            # 如果有多条路可以选
+            sum_cap = 0
+            for j in range(self.nodeSet[node].num_link):
+                index = self.nodeSet[node].links[j]
+                sum_cap += self.nodeSet[node].ylist[k, j] * self.ijlinkSet[index].baseCap
+
+            for j in range(self.nodeSet[node].num_link):
+                index = self.nodeSet[node].links[j]
+                self.nodeSet[node].factor[k, j] = self.nodeSet[node].ylist[k, j] * self.ijlinkSet[index].baseCap / sum_cap
+
+        for i in range(self.nodeSet[node].num_link):
+            ij_index = self.nodeSet[node].links[i]
+            #  计算该方案下的分流值
+            ts_slot_traffic0 = sum(
+                self.nodeSet[node].factor[k][i] * self.nodeSet[node].node_demand[ts][0][k] for k in range(3))
+            ts_slot_traffic1 = sum(
+                self.nodeSet[node].factor[k][i] * self.nodeSet[node].node_demand[ts][1][k] for k in range(3))
+            #  将该值赋给ij链路
+            self.ijlinkSet[ij_index].traffic0[t] = ts_slot_traffic0
+            self.ijlinkSet[ij_index].traffic1[t] = ts_slot_traffic1
+
+            if decide_sort:  # 是否需要计算价格（只有进行策略比较的时候需要）
+
+                if ts_slot_traffic0 >= self.ijlinkSet[ij_index].temp_billing_bd_next[0]:
+                    if ts_slot_traffic1 >= self.ijlinkSet[ij_index].temp_billing_bd_next[1]: # ts上下行流量特别大
+                        self.ijlinkSet[ij_index].billBandwidth = max(self.ijlinkSet[ij_index].temp_billing_bd_next)
+                    elif ts_slot_traffic1 > self.ijlinkSet[ij_index].temp_billing_bd[1]:
+                        self.ijlinkSet[ij_index].billBandwidth = max(self.ijlinkSet[ij_index].temp_billing_bd_next[0], ts_slot_traffic1)
+                    else:
+                        self.ijlinkSet[ij_index].billBandwidth = max(self.ijlinkSet[ij_index].temp_billing_bd_next[0],self.ijlinkSet[ij_index].temp_billing_bd[1])
+
+                elif ts_slot_traffic0 >= self.ijlinkSet[ij_index].temp_billing_bd[0]:
+                    if ts_slot_traffic1 >= self.ijlinkSet[ij_index].temp_billing_bd_next[1]: # ts上下行流量特别大
+                        self.ijlinkSet[ij_index].billBandwidth = max(ts_slot_traffic0, self.ijlinkSet[ij_index].temp_billing_bd_next[1])
+                    elif ts_slot_traffic1 > self.ijlinkSet[ij_index].temp_billing_bd[1]:
+                        self.ijlinkSet[ij_index].billBandwidth = max(ts_slot_traffic0, ts_slot_traffic1)
+                    else:
+                        self.ijlinkSet[ij_index].billBandwidth = max(ts_slot_traffic0,self.ijlinkSet[ij_index].temp_billing_bd[1])
+
+                else:
+                    if ts_slot_traffic1 >= self.ijlinkSet[ij_index].temp_billing_bd_next[1]: # ts上下行流量特别大
+                        self.ijlinkSet[ij_index].billBandwidth = max(self.ijlinkSet[ij_index].temp_billing_bd[0], self.ijlinkSet[ij_index].temp_billing_bd_next[1])
+                    elif ts_slot_traffic1 > self.ijlinkSet[ij_index].temp_billing_bd[1]:
+                        self.ijlinkSet[ij_index].billBandwidth = max(self.ijlinkSet[ij_index].temp_billing_bd[0], ts_slot_traffic1)
+                    else:
+                        self.ijlinkSet[ij_index].billBandwidth = max(self.ijlinkSet[ij_index].temp_billing_bd)
+
+
+    def find_min(self, node, compare_ij_cost, compare_ri_cost, mincost, last_traffic_beyond_base_ij, traffic_beyond_base_ij, last_traffic_beyond_base_ri, traffic_beyond_base_ri, index1, index2):
+        """
+        function:
+        Input:
+        Output:
+        """
+        compare_cost = compare_ij_cost + compare_ri_cost
+        if compare_cost < mincost:
+            mincost = compare_cost
+            last_traffic_beyond_base_ij = traffic_beyond_base_ij
+            last_traffic_beyond_base_ri = traffic_beyond_base_ri
+            self.nodeSet[node].y_min = self.nodeSet[node].ylist.copy()
+
+        elif compare_cost == mincost:
+            if traffic_beyond_base_ij < last_traffic_beyond_base_ij:
+                last_traffic_beyond_base_ij = traffic_beyond_base_ij
+                last_traffic_beyond_base_ri = traffic_beyond_base_ri
+                self.nodeSet[node].y_min = self.nodeSet[node].ylist.copy()
+
+            elif traffic_beyond_base_ij == last_traffic_beyond_base_ij:
+                if traffic_beyond_base_ri < last_traffic_beyond_base_ri:
+                    last_traffic_beyond_base_ri = traffic_beyond_base_ri
+                    last_traffic_beyond_base_ij = traffic_beyond_base_ij
+                    self.nodeSet[node].y_min = self.nodeSet[node].ylist.copy()
+
+
+        return mincost, last_traffic_beyond_base_ij, last_traffic_beyond_base_ri
+
+    def clear_traffic(self, ts, steps):
+        """
+            function: 因为baseAllocate属性已经把各个时刻各链路流量值分配下去了，做预测时需要把l-steps的流量值置0
+        """
+        for i in range(linkNum_ri):
+            for t in range(ts, ts + steps):
+                self.rilinkSet[i].traffic0[t] = 0
+                self.rilinkSet[i].traffic1[t] = 0
+        for i in range(linkNum_ij):
+            for t in range(ts, ts + steps):
+                self.ijlinkSet[i].traffic0[t] = 0
+                self.ijlinkSet[i].traffic1[t] = 0
+
+    def clear_ri_traffic(self, ts, steps):
+        """
+        删除ri链路流量
+        :param ts:
+        :param steps:
+        :return:
+        """
+        for i in range(linkNum_ri):
+            for t in range(ts, ts + steps):
+                self.rilinkSet[i].traffic0[t] = 0
+                self.rilinkSet[i].traffic1[t] = 0
+
+    def sat_sols(self):
+        self.node_feasible_sol = {}
+        for node in range(groundNode):
+            nodeSet[node].y_SLA = self.Y_start(node, link_groundNode_app)
+            y_sol = {}  # 各业务选路方案
+            len_sol = [0 for _ in range(appKinds)]  # 选路方案个数
+            for k in range(appKinds):
+                y_k, lengthk = self.modify_Yk(node, k)
+                y_sol[str(k)] = y_k
+                len_sol[k] = lengthk
+            y_sol, len_sol = self.Y_feasible(y_sol, len_sol)
+            self.node_feasible_sol[str(node)] = y_sol  # 站点所有可行选路方案 size: {"1":[[3*3],[3*3],...],...}
+
+
+    def allocate_ri(self, node, t):
+        """
+        分配t时刻除去node的ri链路流量
+        :param ts:
+        :return:
+        """
+
+        for gn in range(groundNode):
+            if gn != node:
+                for i in range(self.nodeSet[gn].num_link):
+                    ij_index = self.nodeSet[gn].links[i]
+                    ri_index = ij_ri[str(ij_index)]
+                    self.rilinkSet[ri_index].traffic0[t] += self.ijlinkSet[ij_index].traffic0[t]
+                    self.rilinkSet[ri_index].traffic1[t] += self.ijlinkSet[ij_index].traffic1[t]
+
+
+    def get_ij_billingbd(self, node, ts):
+        """
+        获取node站点所连链路上8639个时刻的计费带宽
+        :param node: 待分配站点
+        :param ts: 时刻
+        :return:
+        """
+        for ij_link in range(self.nodeSet[node].num_link):
+            ij_index = self.nodeSet[node].links[ij_link]
+            self.ijlinkSet[ij_index].traffic0[ts] = 0  # 将此时刻流量值替换为0，这样能够得到8639个流量值的临时计费带宽
+            self.ijlinkSet[ij_index].traffic1[ts] = 0
+
+            bill0 = self.ijlinkSet[ij_index].traffic0.tolist()
+            bill0.sort()
+            bill0.reverse()
+
+            bill1 = self.ijlinkSet[ij_index].traffic1.tolist()
+            bill1.sort()
+            bill1.reverse()
+
+            self.ijlinkSet[ij_index].temp_billing_bd[0] = bill0[p95]
+            self.ijlinkSet[ij_index].temp_billing_bd[1] = bill1[p95]
+            self.ijlinkSet[ij_index].temp_billing_bd_next[0] = bill0[p95 - 1]  # 比目前的计费带宽稍大的一个值
+            self.ijlinkSet[ij_index].temp_billing_bd_next[1] = bill1[p95 - 1]
+
+        for ri_link_index in range(linkNum_ri):
+            self.rilinkSet[ri_link_index].traffic0[ts] = 0
+            self.rilinkSet[ri_link_index].traffic1[ts] = 0  # 将此时刻流量值替换为0，这样能够得到8639个流量值的临时计费带宽
+
+            bill0 = self.rilinkSet[ri_link_index].traffic0.tolist()
+            bill0.sort()
+            bill0.reverse()
+
+            bill1 = self.rilinkSet[ri_link_index].traffic1.tolist()
+            bill1.sort()
+            bill1.reverse()
+
+            self.rilinkSet[ri_link_index].temp_billing_bd[0] = bill0[p95]
+            self.rilinkSet[ri_link_index].temp_billing_bd[1] = bill1[p95]
+            self.rilinkSet[ri_link_index].temp_billing_bd_next[0] = bill0[p95 - 1]  # 比目前的计费带宽稍大的一个值
+            self.rilinkSet[ri_link_index].temp_billing_bd_next[1] = bill1[p95 - 1]
+
+    def cal_indicator_function(self, node, ts):
+        """
+        计算在该分配下，指标函数中第一项（下层链路的费用）以及第二项中被减数的值（上层链路的费用）
+        :param node:
+        :param ts:
+        :return: 指标函数第一项与第二项中的被减数
+        """
+        node_ij_cost, ri_cost = 0, 0
+        ri_traffic_t_dict = {}
+        for i in range(linkNum_ri):
+            ri_traffic_t_dict[i] = np.zeros(2)
+        for i in range(self.nodeSet[node].num_link):
+            # 计算下层链路费用
+            ij_index = self.nodeSet[node].links[i]
+            self.ij_cost_base_bb(ij_index)
+            node_ij_cost += self.ijlinkSet[ij_index].price
+
+            ri_index = ij_ri[str(ij_index)]  # 将该站点的流量加到上层链路中
+            ri_traffic_t_dict[ri_index][0] += self.ijlinkSet[ij_index].traffic0[t]
+            ri_traffic_t_dict[ri_index][1] += self.ijlinkSet[ij_index].traffic1[t]
+
+        # 计算ri链路p95带宽和费用
+        for ri_index in range(linkNum_ri):
+            self.rilinkSet[ri_index].traffic0[t] += ri_traffic_t_dict[ri_index][0]
+            self.rilinkSet[ri_index].traffic1[t] += ri_traffic_t_dict[ri_index][1]
+
+            if self.rilinkSet[ri_index].traffic0[t] >= self.rilinkSet[ri_index].temp_billing_bd_next[0]:
+                if self.rilinkSet[ri_index].traffic1[t] >= self.rilinkSet[ri_index].temp_billing_bd_next[1]:  # ts上下行流量特别大
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].temp_billing_bd_next)
+                elif self.rilinkSet[ri_index].traffic1[t] > self.rilinkSet[ri_index].temp_billing_bd[1]:
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].temp_billing_bd_next[0],
+                                                        self.rilinkSet[ri_index].traffic1[t])
+                else:
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].temp_billing_bd_next[0],
+                                                        self.rilinkSet[ri_index].temp_billing_bd[1])
+
+            elif self.rilinkSet[ri_index].traffic0[t] >= self.rilinkSet[ri_index].temp_billing_bd[0]:
+                if self.rilinkSet[ri_index].traffic1[t] >= self.rilinkSet[ri_index].temp_billing_bd_next[1]:  # ts上下行流量特别大
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].traffic0[t],
+                                                        self.rilinkSet[ri_index].temp_billing_bd_next[1])
+                elif self.rilinkSet[ri_index].traffic1[t] > self.rilinkSet[ri_index].temp_billing_bd[1]:
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].traffic0[t], self.rilinkSet[ri_index].traffic1[t])
+                else:
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].traffic0[t], self.rilinkSet[ri_index].temp_billing_bd[1])
+
+            else:
+                if self.rilinkSet[ri_index].traffic1[t] >= self.rilinkSet[ri_index].temp_billing_bd_next[1]:  # ts上下行流量特别大
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].temp_billing_bd[0],
+                                                        self.rilinkSet[ri_index].temp_billing_bd_next[1])
+                elif self.rilinkSet[ri_index].traffic1[t] > self.rilinkSet[ri_index].temp_billing_bd[1]:
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].temp_billing_bd[0], self.rilinkSet[ri_index].traffic1[t])
+                else:
+                    self.rilinkSet[ri_index].billBandwidth = max(self.rilinkSet[ri_index].temp_billing_bd)
+            self.ri_cost_base_bb(ri_index)
+            ri_cost += self.rilinkSet[ri_index].price
+            # 还原上层链路
+            self.rilinkSet[ri_index].traffic0[t] -= ri_traffic_t_dict[ri_index][0]
+            self.rilinkSet[ri_index].traffic1[t] -= ri_traffic_t_dict[ri_index][1]
+        return node_ij_cost, ri_cost
+
+
+    def cal_traffic_beyond_base_ij(self, node, t):
+        """
+        计算该候选策略下，分配的流量值与链路basecap的差值，差值越小越好
+        :param node:
+        :param ts:
+        :return:
+        """
+        traffic_beyond_base = 0
+        for i in range(self.nodeSet[node].num_link):
+            ij_index = self.nodeSet[node].links[i]
+            max_traffic = max(self.ijlinkSet[ij_index].traffic0[t], self.ijlinkSet[ij_index].traffic1[t])
+
+            if max_traffic > self.ijlinkSet[ij_index].baseCap:
+                traffic_beyond_base += max_traffic - self.ijlinkSet[ij_index].baseCap
+
+        return traffic_beyond_base
+
+
+    def cal_traffic_beyond_base_ri(self, t):
+        """
+        计算该候选策略下，ri分配的流量值与链路basecap的差值，差值越小越好
+        :param node:
+        :param ts:
+        :return:
+        """
+        traffic_beyond_base_ri = 0
+        for ri_index in range(linkNum_ri):
+            max_traffic = max(self.rilinkSet[ri_index].traffic0[t], self.rilinkSet[ri_index].traffic1[t])
+            if max_traffic > self.rilinkSet[ri_index].baseCap:
+                traffic_beyond_base_ri += max_traffic - self.rilinkSet[ri_index].baseCap
+
+        return traffic_beyond_base_ri
+
+
+    def save_ij_data_to_array(self, node, ts):
+        """
+
+        :param node:
+        :param ts:
+        :return:
+        """
+        for i in range(self.nodeSet[node].num_link):
+            ij_index = self.nodeSet[node].links[i]
+            traffic0[ts, ij_index + linkNum_ri] = self.ijlinkSet[ij_index].traffic0[ts]
+            traffic1[ts, ij_index + linkNum_ri] = self.ijlinkSet[ij_index].traffic1[ts]
+
+    def save_ri_data_to_array(self, ts):
+        """
+
+        :param node:
+        :param ts:
+        :return:
+        """
+        for ri_index in range(linkNum_ri):
+            traffic0[ts, ri_index] = self.rilinkSet[ri_index].traffic0[ts]
+            traffic1[ts, ri_index] = self.rilinkSet[ri_index].traffic1[ts]
+
+
+    def choose_route(self, ts):
+        start_time = time.time()
+        self.clear_traffic(ts, self.steps)
+
+        index1 = 0.5
+        index2 = 1 - index1
+
+        node_sum = sortData(demand, groundNode, sampleTime, nodeBase, nodeBasecost, nodeExtra, ts, self.steps)
+
+        for node_index in range(groundNode):
+            node = int(node_sum[node_index])  # 依次取排完序后的站点
+            if node_index == 0 and ts == 0:  #  当t=0时，如何进行分配
+                for temp_node in range(groundNode):
+                    self.static_allocate(temp_node, ts)
+
+            # 虚拟布防各站点的流量,布放的是上一个时刻的选路策略，注意，这里只布放了下层链路流量
+            if node_index == 0 and ts != 0:
+                for temp_index in range(1, groundNode):
+                    temp_node = int(node_sum[temp_index])  # 依次取排完序后的站点
+                    self.static_allocate(temp_node, ts)  # 只布放了下层链路
+
+            # 单站点三种业务的联合布防
+            # 变量赋初值
+            mincost = M * M * M
+            last_traffic_beyond_base_ij = M * M
+            last_traffic_beyond_base_ri = M * M
+            # 固定各个链路的流量值
+            self.get_ij_billingbd(node, ts)
+            # 对于每个站点而言，还未开始遍历决策，但是先要将除去该站点外的下层流量布放到上层去，需要清除此时刻流量
+            self.clear_ri_traffic(ts, self.steps)
+            self.allocate_ri(node, ts)  # 计算ts时刻、未分配node站点时的ri链路流量值
+
+            for sol in self.node_feasible_sol[str(node)]:
+                self.nodeSet[node].ylist = sol  # 取出当前策略
+                self.static_allocate(node, ts, decide_sort=True)  # 计算此方案下与node相连的ij链路分配的上下行流量，并且计算该链路费用
+                # 为ri链路加上该站点的流量，并计算在该分配下，指标函数中第一项（下层链路的费用）（上层链路的费用）
+                # 然后还原上层链路流量
+                compare_ij_cost, compare_ri_cost = self.cal_indicator_function(node, ts)
+                traffic_beyond_base_ij = self.cal_traffic_beyond_base_ij(node, ts)
+                traffic_beyond_base_ri = self.cal_traffic_beyond_base_ri(ts)
+
+                mincost, last_traffic_beyond_base_ij, last_traffic_beyond_base_ri = self.find_min(node, compare_ij_cost, compare_ri_cost,  mincost, last_traffic_beyond_base_ij, traffic_beyond_base_ij, last_traffic_beyond_base_ri, traffic_beyond_base_ri,
+                                        index1, index2)
+
+            # 最终单站点分配策略
+            self.nodeSet[node].ylist = self.nodeSet[node].y_min.copy()
+
+            self.static_allocate(node, ts)
+            self.save_ij_data_to_array(node, ts)
+
+        # 所有决策做完后，分配上层ri链路（直接将下层链路流量布放到上层即可
+        self.clear_ri_traffic(ts, self.steps)
+        for node in range(groundNode):
+            for i in range(self.nodeSet[node].num_link):
+                ri_index = ij_ri[str(self.nodeSet[node].links[i])]
+                ij_index = self.nodeSet[node].links[i]
+                for t in range(ts, ts + self.steps):
+                    self.rilinkSet[ri_index].traffic0[t] += self.ijlinkSet[ij_index].traffic0[t]
+                    self.rilinkSet[ri_index].traffic1[t] += self.ijlinkSet[ij_index].traffic1[t]
+        self.save_ri_data_to_array(ts)
+        end_time = time.time()
+        print("处理时间:", end_time - start_time)
+
+
+class RouteOptimize:
+    def __init__(self, Nodes, ijLinks, ri_links, steps):
+
+        self.Nodes = Nodes
+        self.ijlinkSet = ijLinks
+        self.rilinkSet = ri_links
+        self.steps = steps
+        self.current_policy = []
+        self.flow_curve = np.zeros((8, sampleTime))  # 第一维度：0-2: app{}_Out, 3-5:app{}_In, 6-7:all_Out/In
+
+
+        # 创建选路方案类
+        self.chooseRoute = PredictRouteOptimez(self.Nodes, self.ijlinkSet, self.rilinkSet,
+                                            self.steps)
+
+    def add_predicted_to_node(self, t, data):  # data[p, gn, k]
+        """
+        将预测数据加入节点需求
+        :param data:
+        :return:
+        """
+
+        for p in range(2):
+            for k in range(appKinds):
+                for gn in range(groundNode):
+                    self.chooseRoute.nodeSet[gn].node_demand[t][p][k] = data[p][gn][k]
+
+
+    def set_columns_name(self):
+        for ri in range(linkNum_ri):
+            traffic_name.append("rilink{}".format(ri))
+
+        for n in range(groundNode):
+            for l in range(len(self.chooseRoute.nodeSet[n].y_min[0])):
+                traffic_name.append("ijlink_{}".format(self.chooseRoute.nodeSet[n].links[l]))
+
+
+        for n in range(groundNode):
+            for app in range(appKinds):
+                for l in range(len(self.chooseRoute.nodeSet[n].y_min[0])):
+                    y_policy_name.append("app_{}_link_{}".format(app, self.chooseRoute.nodeSet[n].links[l]))
+
+    def add_predicted_to_curve_version1(self, t, data):
+        """
+        将预测数据加入曲线中
+        :param t:
+        :param data:
+        :return:
+        """
+        for i in range(8):
+            np.roll(self.flow_curve[i], -1)  # 将所有数据向左移动一位
+
+        for p in range(2):
+            for k in range(appKinds):
+                # 加入flow_curve中
+                self.flow_curve[3 * p + k, -1] = sum(data[p, gn, k] for gn in range(groundNode))  # 将新数据放在流的最后一位
+
+        self.flow_curve[6, -1] = self.flow_curve[0, -1] + self.flow_curve[1, -1] + self.flow_curve[2, -1]
+        self.flow_curve[7, -1] = self.flow_curve[3, -1] + self.flow_curve[4, -1] + self.flow_curve[5, -1]
+
+    def run(self, ts):
+        self.chooseRoute.choose_route(ts)
+
+
+    def cal_total_cost(self, t, ifbool=False):  # 保存新计算得到的选路分配策略
+        if (ifbool):
+            for i in range(linkNum_ri):
+                self.chooseRoute.ri_cal_cost(i)
+            for j in range(linkNum_ij):
+                self.chooseRoute.cal_ij_cost(j)
+        totalcost = sum(self.chooseRoute.ijlinkSet[i].price for i in range(linkNum_ij)) + sum(
+            self.chooseRoute.rilinkSet[j].price for j in range(linkNum_ri))
+        if ifbool == False:
+            temp_y = []
+            for n in range(groundNode):
+                for app in range(appKinds):
+                    for l in range(len(self.chooseRoute.nodeSet[n].y_min[0])):
+                        temp_y.append(self.chooseRoute.nodeSet[n].y_min[app][l])
+
+                        # y_policy_name.append("app_{}_link_{}".format(app, self.chooseRoute.nodeSet[n].links[l]))
+            y_policy.append(temp_y)
+            #
+            # temp_bw = []
+            # for i in range(linkNum_ri):
+            #     temp_bw.append(self.chooseRoute.rilinkSet[i].price)
+            # for j in range(linkNum_ij):
+            #     temp_bw.append(self.chooseRoute.ijlinkSet[j].price)
+            # data_bw.append(temp_bw)
+            if t == sampleTime - 1:
+                print()
+
+        print("total cost", totalcost)
+
+        return totalcost
+
+    def save_new_allocate(self, t, new_policy):  # 保存新计算得到的选路分配策略
+        return
+
+    def get_inital_flow_curve(self, history_flow_file):
+        """
+        在前100个时刻，因为数据量太少，无法构成流量曲线及求特征，故结合上个月的历史流量数据帮助形成数据
+        :param history_flow_file:
+        :return:
+        """
+        history_demand = readODData(groundNode, history_flow_file, sampleTime)  # [sampleTime, 2, groundNode, 3]
+        for t in range(sampleTime):
+            for p in range(2):
+                for k in range(3):
+                    for gn in range(groundNode):
+                        self.flow_curve[3 * p + k, t] += history_demand[t, p, gn, k]
+            self.flow_curve[6, t] += self.flow_curve[0, t] + self.flow_curve[1, t] + self.flow_curve[2, t]
+            self.flow_curve[7, t] += self.flow_curve[3, t] + self.flow_curve[4, t] + self.flow_curve[5, t]
+
+
+
+    def change_base_allocate(self, t, data_path, db_traffic_index, last_db_traffic_index):  # 修改future部分的基本分配方案
+        if db_traffic_index not in db_traffic_dict: # 如果第一次使用该曲线，则将其读出后存在db_traffic_dict中
+            data = get_db_traffic(data_path, db_traffic_index, sampleTime, linkNum)
+            db_traffic_dict[db_traffic_index] = data
+        else:
+            data = db_traffic_dict[db_traffic_index]  # data[2, sampleTime, link]
+        # 复制流量
+        if db_traffic_index != last_db_traffic_index:
+            for i in range(linkNum_ri):
+                self.chooseRoute.rilinkSet[i].traffic0[t + 1:sampleTime] = data[0, t + 1:sampleTime, i]
+                self.chooseRoute.rilinkSet[i].traffic1[t + 1:sampleTime] = data[1, t + 1:sampleTime, i]
+            for i in range(linkNum_ij):
+                self.chooseRoute.ijlinkSet[i].traffic0[t + 1:sampleTime] = data[0, t + 1:sampleTime, i + linkNum_ri]
+                self.chooseRoute.ijlinkSet[i].traffic1[t + 1:sampleTime] = data[1, t + 1:sampleTime, i + linkNum_ri]
+
+
+        # 复制0时刻策略
+        if t == 0:
+            time0_policy = get_db_time0_policy(data_path)
+            link_cnt = 0
+            for node in range(groundNode):
+                for k in range(appKinds):
+                    for link in range(self.chooseRoute.nodeSet[node].num_link):
+                        self.chooseRoute.nodeSet[node].ylist[k, link] = time0_policy[link_cnt]
+                        link_cnt += 1
+
+        return
+
+
+
+db_traffic_dict = {}
+
+
+
+import time
+if __name__ == '__main__':
+    start_time = time.time()
+    # print("data:{}".format(data_index))
+    final_data = np.zeros([sampleTime, 2])
+    lsteps = 1
+    network = RouteOptimize(nodeSet, ijlinkSet, rilinkSet, lsteps)
+    # network.get_inital_flow_curve(history_flow_file_path)
+    select_db_record = []
+    last_db_traffic_index = -1
+    network.set_columns_name()
+
+
+    for t in range(sampleTime):  # 向后预测1步
+        print(t)
+        predicted_data = predicted_data_array[t]
+        network.add_predicted_to_node(t, predicted_data)  # 将预测数据放入了demand和流曲线里
+        # network.add_predicted_to_curve_version1(t, predicted_data)  # 将预测数据放入了demand和流曲线里
+        # network.extract_features_from_past(t)  # 根据流曲线提取特征
+        # db_traffic_index = network.select_file_based_features(t)  # 根据特征选取数据库文件 这里后续还要注意时间对齐
+        # select_db_record.append(db_traffic_index)
+        db_traffic_index = 0
+        network.change_base_allocate(t, data_path, db_traffic_index, last_db_traffic_index)  # 修改填入traffic里的future流量
+
+        last_db_traffic_index = db_traffic_index
+
+        network.run(t)
+
+        total_cost = network.cal_total_cost(t)
+        final_data[t][0] = t
+        final_data[t][1] = total_cost
+
+    end_time = time.time()
+    # print("data:{}".format(data_index))
+    print("总耗时：", end_time - start_time)
+    with open(os.path.join(dataResultPath, "time_record.txt"), "a") as f1:
+        f1.write("\n")
+        f1.write("\n")
+        f1.write("总时间: " + str(end_time - start_time))
+        f1.close()
+    with open(os.path.join(dataResultPath, "total_cost.txt"), "a") as f1:
+        f1.write("\n")
+        f1.write("\n")
+        f1.write("总费用: " + str(total_cost))
+        f1.close()
+
+
+
+    p2 = pd.DataFrame(data=np.array(y_policy), columns=y_policy_name)
+    p2.to_csv(os.path.join(dataResultPath, "y_policy.csv"))
+    p3 = pd.DataFrame(data=traffic0, columns=traffic_name)
+    p3.to_csv(os.path.join(dataResultPath, "traffic0.csv"))
+    p4 = pd.DataFrame(data=traffic1, columns=traffic_name)
+    p4.to_csv(os.path.join(dataResultPath, "traffic1.csv"))
+
+
+    # np.savetxt("Results4/data_bw_v6_" + str(lsteps) + "_steps_3-23.csv", np.array(data_bw), fmt="%f", delimiter=",")
+    # np.savetxt("Results4/main_v6_" + str(lsteps) + "_steps_3-23.csv", final_data, fmt="%f", delimiter=",")
+    # np.savetxt("Results4/y_list_v6_" + str(lsteps) + "_steps_3-23.csv", np.array(y_policy), fmt="%d", delimiter=",")
+    # np.savetxt("Results4/selected_db_" + str(lsteps) + "_steps_3-23.csv", np.array(select_db_record), fmt="%d", delimiter=",")
